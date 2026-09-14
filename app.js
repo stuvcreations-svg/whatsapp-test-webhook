@@ -22,18 +22,11 @@ Rules:
 - When all details are gathered, summarize the request and confirm that a specialist will be in touch.
 `;
 
-// Handshake verification for Meta
-app.get('/', (req, res) => {
-  const { 'hub.mode': mode, 'hub.challenge': challenge, 'hub.verify_token': token } = req.query;
-  if (mode === 'subscribe' && token === verifyToken) {
-    res.status(200).send(challenge);
-  } else {
-    res.status(403).end();
-  }
-});
-
 // Handle incoming messages
 app.post('/', async (req, res) => {
+  console.log('>>> INCOMING WEBHOOK HIT <<<');
+  console.log(JSON.stringify(req.body, null, 2));
+
   res.status(200).end(); // Acknowledge Meta immediately
 
   const entry = req.body.entry?.[0]?.changes?.[0]?.value;
@@ -87,5 +80,3 @@ app.post('/', async (req, res) => {
     console.error('Error handling webhook:', err);
   }
 });
-
-app.listen(port, () => console.log(`Listening on port ${port}`));
