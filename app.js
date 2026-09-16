@@ -30,7 +30,7 @@ Conversation Guidelines:
 - Ask only ONE question at a time.
 - If the user provides multiple pieces of information in one message (e.g., "Need an asphalt shingle replacement at 104 Main St"), acknowledge what they gave and smoothly ask for the next missing item.
 - Keep messages short, professional, and readable on WhatsApp (use bullet points or emojis sparingly).
-- Once all 9 items are gathered, output a clean, formatted summary of the job specs and confirm that the estimating team will review satellite/aerial data and reach out with the quote.
+- Once all items are gathered, output a clean, formatted summary of the job specs and confirm that the estimating team will reach out with the formal proposal.
 `;
 
 // Meta Webhook Verification (GET)
@@ -63,19 +63,16 @@ app.post('/', async (req, res) => {
 
   console.log(`From: ${senderPhone} | Message: ${incomingText}`);
 
-  // Retrieve or initialize conversation history for this sender
   if (!conversations.has(senderPhone)) {
     conversations.set(senderPhone, []);
   }
   const history = conversations.get(senderPhone);
 
-  // Append user message
   history.push({
     role: 'user',
     parts: [{ text: incomingText }]
   });
 
-  // Keep history manageable (last 16 messages / 8 turns)
   if (history.length > 16) {
     history.splice(0, history.length - 16);
   }
@@ -87,18 +84,20 @@ app.post('/', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        system_instruction: { parts: [{ text: ROOFING_INTAKE_PROMPT }] },
+        system_instruction: {
+          parts: [{ text: ROOFING_INTAKE_PROMPT }]
+        },
         contents: history
       })
     });
 
     const aiData = await aiResponse.json();
     console.log('Gemini raw response:', JSON.stringify(aiData));
+
     const replyText =
       aiData.candidates?.[0]?.content?.parts?.[0]?.text ||
       'Thanks for reaching out! Could you share the property address for your roofing project?';
 
-    // Store bot reply in memory
     history.push({
       role: 'model',
       parts: [{ text: replyText }]
@@ -106,7 +105,6 @@ app.post('/', async (req, res) => {
 
     console.log(`Gemini Reply: ${replyText}`);
 
-    // Send reply back via WhatsApp Cloud API
     const waResponse = await fetch(`https://graph.facebook.com/v21.0/${waPhoneId}/messages`, {
       method: 'POST',
       headers: {
