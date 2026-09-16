@@ -93,6 +93,7 @@ app.post('/', async (req, res) => {
     });
 
     const aiData = await aiResponse.json();
+    console.log('Gemini raw response:', JSON.stringify(aiData));
     const replyText =
       aiData.candidates?.[0]?.content?.parts?.[0]?.text ||
       'Thanks for reaching out! Could you share the property address for your roofing project?';
