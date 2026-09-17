@@ -1,6 +1,12 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
+
 const app = express();
 app.use(express.json());
+
+// Expose the public folder so WhatsApp and browsers can view files
+app.use('/files', express.static(path.join(__dirname, 'public')));
 
 const port = process.env.PORT || 3000;
 const verifyToken = process.env.VERIFY_TOKEN;
@@ -8,45 +14,90 @@ const waToken = process.env.WA_TOKEN;
 const waPhoneId = process.env.WA_PHONE_ID;
 const geminiApiKey = process.env.GEMINI_API_KEY;
 
-// Store state per phone number in memory
-// Schema: { currentStep: number, data: Object, isComplete: boolean }
 const userSessions = new Map();
 
 const DEFAULT_STATE = {
   property_address: null,
-  scope_of_work: null, // full tear-off, repair, new construction
-  existing_roof_material: null, // shingle, tile, metal, flat
+  scope_of_work: null,
+  existing_roof_material: null,
   desired_new_material: null,
-  building_stories: null, // 1-story, 2-story
+  building_stories: null,
   active_leaks_or_decking_damage: null,
   insurance_or_retail: null,
   timeline: null,
   client_name: null
 };
 
-const PROTOCOL_INSTRUCTIONS = `
-You are an AI intake coordinator for a professional roofing contractor.
-Your objective is to guide the user through a strict, sequential intake protocol.
+const SYSTEM_INSTRUCTION = `
+You are an expert AI intake coordinator for a roofing contractor.
+Guide the homeowner through this sequential intake protocol:
 
-Protocol Sequence:
-1. property_address: Street address, city, and zip.
-2. scope_of_work: Full tear-off replacement, leak repair, or new construction.
-3. existing_roof_material: Current material (shingles, tile, metal, flat/mod-bit).
-4. desired_new_material: Material to install (architectural shingles, metal, tile, coating).
-5. building_stories: Height/stories (1-story, 2-story, etc.).
-6. active_leaks_or_decking_damage: Any current leaks or damaged wood/plywood.
-7. insurance_or_retail: Insurance claim or direct retail/cash quote.
-8. timeline: Preferred timeline (immediate emergency, 2-4 weeks, flexible).
-9. client_name: Name and best contact info for the proposal.
+1. property_address: Street, city, state, zip.
+2. scope_of_work: Replacement, leak repair, or new construction.
+3. existing_roof_material: Current material (shingles, tile, metal, flat).
+4. desired_new_material: Material to install (shingles, metal, tile).
+5. building_stories: 1-story, 2-story, etc.
+6. active_leaks_or_decking_damage: Active leaks or suspected wood damage.
+7. insurance_or_retail: Insurance claim or cash/retail quote.
+8. timeline: Emergency, 2-4 weeks, or flexible.
+9. client_name: Full name and email for the estimate delivery.
 
 Rules:
-- You must output VALID JSON only, following the exact schema provided.
-- Inspect the user's message and update "collected_data" with any provided details. If they provide multiple fields at once, extract all of them.
-- Look at the first field in the protocol sequence that remains null. That determines the next question.
-- "customer_reply": Ask ONLY ONE concise, professional question for that missing item. Do not combine multiple questions.
-- If the user asks an off-topic question, briefly redirect them back to the current protocol question in "customer_reply".
-- When all 9 items are filled, set "is_complete": true. Set "customer_reply" to a crisp bulleted summary of the project details, stating that an estimator will review aerial imagery and provide the quote.
+- Return ONLY valid raw JSON with keys: "collected_data", "customer_reply", and "is_complete".
+- Extract incoming user details into "collected_data".
+- Ask ONLY ONE question for the earliest field that is still null in "customer_reply".
+- Set "is_complete": true when all 9 fields have values.
 `;
+
+// Helper: Injects collected data and expands repeating blocks in the template
+function populateQuoteTemplate(templateHtml, data) {
+  let html = templateHtml;
+
+  // Expand Scope repeating block
+  const scopeRegex = /<!-- REPEAT:scope -->([\s\S]*?)<!-- END:scope -->/;
+  const scopeMatch = html.match(scopeRegex);
+  if (scopeMatch && Array.isArray(data.scope)) {
+    const block = scopeMatch[1];
+    const expanded = data.scope.map(item =>
+      block.replace(/{{scope_title}}/g, item.title || '').replace(/{{scope_detail}}/g, item.detail || '')
+    ).join('\n');
+    html = html.replace(scopeRegex, expanded);
+  }
+
+  // Expand Materials repeating block
+  const matRegex = /<!-- REPEAT:materials -->([\s\S]*?)<!-- END:materials -->/;
+  const matMatch = html.match(matRegex);
+  if (matMatch && Array.isArray(data.materials)) {
+    const block = matMatch[1];
+    const expanded = data.materials.map(m =>
+      block.replace(/{{material_name}}/g, m.name || '')
+           .replace(/{{material_qty}}/g, m.qty || '')
+           .replace(/{{material_unit_price}}/g, m.unit_price || '')
+           .replace(/{{material_line_total}}/g, m.line_total || '')
+    ).join('\n');
+    html = html.replace(matRegex, expanded);
+  }
+
+  // Clean empty repeating blocks
+  html = html.replace(/<!-- REPEAT:spots -->[\s\S]*?<!-- END:spots -->/g, '');
+
+  // Static company brand info
+  const companyDefaults = {
+    company_name: "Apex Elite Roofing",
+    company_tagline: "Precision Roofing & Storm Restoration",
+    company_phone: "(239) 555-0199",
+    company_email: "estimates@apexroofing.com",
+    company_address: "Cape Coral, FL 33904",
+    license_number: "CCC1332490",
+    workmanship_warranty_text: "10-year defect-free installation warranty backed directly by Apex Elite Roofing.",
+    manufacturer_warranty_text: "50-year non-prorated manufacturer warranty on certified architectural materials."
+  };
+
+  const merged = { ...companyDefaults, ...data };
+
+  // Replace remaining single placeholders
+  return html.replace(/{{([a-zA-Z0-9_]+)}}/g, (match, key) => (merged[key] !== undefined ? merged[key] : ''));
+}
 
 // Meta Webhook Verification (GET)
 app.get('/', (req, res) => {
@@ -61,23 +112,18 @@ app.get('/', (req, res) => {
   }
 });
 
-// Incoming Webhook (POST)
+// Incoming WhatsApp Handler (POST)
 app.post('/', async (req, res) => {
   res.status(200).send('EVENT_RECEIVED');
 
   const value = req.body.entry?.[0]?.changes?.[0]?.value || req.body.value;
   const message = value?.messages?.[0];
 
-  if (!message || message.type !== 'text') {
-    return;
-  }
+  if (!message || message.type !== 'text') return;
 
   const senderPhone = message.from;
   const incomingText = message.text.body;
 
-  console.log(`\n--- Incoming from ${senderPhone}: "${incomingText}" ---`);
-
-  // Initialize session state if first-time sender
   if (!userSessions.has(senderPhone)) {
     userSessions.set(senderPhone, {
       data: { ...DEFAULT_STATE },
@@ -87,95 +133,136 @@ app.post('/', async (req, res) => {
 
   const session = userSessions.get(senderPhone);
 
-  // If already finished, acknowledge and stop re-prompting
   if (session.isComplete) {
-    await sendWhatsAppMessage(
-      senderPhone,
-      "We already have your intake details on file! A roofing specialist will reach out shortly. If you need immediate assistance, please give our office a call."
-    );
+    await sendWhatsAppMessage(senderPhone, "Your estimate has already been generated! An estimator will follow up with you shortly.");
     return;
   }
 
   try {
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${geminiApiKey}`;
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`;
 
-    const promptPayload = {
-      system_instruction: {
-        parts: [{ text: PROTOCOL_INSTRUCTIONS }]
-      },
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: JSON.stringify({
-                current_state: session.data,
-                user_message: incomingText
-              })
-            }
-          ]
-        }
-      ],
-      generationConfig: {
-        response_mime_type: 'application/json',
-        temperature: 0.1 // Low temperature ensures strict compliance
-      }
-    };
-
-    const aiResponse = await fetch(geminiUrl, {
+    const geminiResponse = await fetch(geminiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(promptPayload)
-    });
-
-    const aiData = await aiResponse.json();
-    const rawAiOutput = aiData.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!rawAiOutput) {
-      console.error('Gemini error response:', JSON.stringify(aiData));
-      return;
-    }
-
-    const parsed = JSON.parse(rawAiOutput);
-    console.log('Structured Extraction:', parsed.collected_data);
-
-    // Save updated state back into memory
-    session.data = { ...session.data, ...parsed.collected_data };
-    session.isComplete = Boolean(parsed.is_complete);
-
-    // Send the structured conversational reply to WhatsApp
-    await sendWhatsAppMessage(senderPhone, parsed.customer_reply);
-
-  } catch (err) {
-    console.error('Processing failure:', err);
-  }
-});
-
-// Outgoing WhatsApp sender
-async function sendWhatsAppMessage(to, text) {
-  try {
-    const waResponse = await fetch(`https://graph.facebook.com/v21.0/${waPhoneId}/messages`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${waToken}`,
-        'Content-Type': 'application/json'
-      },
       body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        recipient_type: 'individual',
-        to: to,
-        type: 'text',
-        text: { body: text }
+        system_instruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: JSON.stringify({ current_state: session.data, incoming_message: incomingText }) }]
+          }
+        ],
+        generationConfig: {
+          response_mime_type: 'application/json',
+          temperature: 0.1
+        }
       })
     });
 
-    const resData = await waResponse.json();
-    console.log('WhatsApp Delivery Status:', resData.messages ? 'Sent' : resData);
-  } catch (error) {
-    console.error('WhatsApp dispatch error:', error);
+    const geminiData = await geminiResponse.json();
+    const rawAiOutput = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawAiOutput) return;
+
+    const parsed = JSON.parse(rawAiOutput);
+    session.data = { ...session.data, ...parsed.collected_data };
+    session.isComplete = Boolean(parsed.is_complete);
+
+    // Intake complete -> Generate the custom quote file from the template
+    if (session.isComplete) {
+      const quoteNumber = `Q-${Math.floor(100000 + Math.random() * 900000)}`;
+
+      // Prepare data for template
+      const fullQuoteData = {
+        quote_number: quoteNumber,
+        quote_date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+        quote_valid_until: new Date(Date.now() + 30 * 86400000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+        customer_name: session.data.client_name || 'Homeowner',
+        customer_phone: senderPhone,
+        customer_email: 'Provided via chat',
+        property_address: session.data.property_address || 'Job Site',
+        roof_type: session.data.desired_new_material || session.data.existing_roof_material || 'Architectural Shingle',
+        roof_age: 'Not Specified',
+        roof_size_sqft: '2,400',
+        stories: session.data.building_stories || '1 story',
+        diagnosis_summary: `Based on your reported ${session.data.scope_of_work || 'replacement'} scope and ${session.data.active_leaks_or_decking_damage || 'no visible decking rot'}, we have prepared a full tear-off and installation schedule.`,
+        subtotal: '$12,450.00',
+        tax: '$871.50',
+        total: '$13,321.50',
+        deposit_amount: '$1,500.00',
+        estimated_start_date: 'Within 2-3 weeks',
+        estimated_duration: '2-3 business days',
+        scope: [
+          { title: "Tear-off & Deck Inspection", detail: "Remove existing roofing down to plywood substrate and inspect for moisture damage." },
+          { title: "Underlayment & Flashing", detail: "Install high-temp synthetic ice/water underlayment and brand new drip edge perimeter." },
+          { title: "Surface Installation", detail: `Install certified ${session.data.desired_new_material || 'architectural'} roofing per local building code.` }
+        ],
+        materials: [
+          { material_name: "Architectural Roofing Material (Squares)", material_qty: "26", material_unit_price: "$210.00", material_line_total: "$5,460.00" },
+          { material_name: "Synthetic Underlayment Rolls", material_qty: "6", material_unit_price: "$115.00", material_line_total: "$690.00" },
+          { material_name: "Tear-off, Labor, & Disposal Services", material_qty: "1", material_unit_price: "$6,300.00", material_line_total: "$6,300.00" }
+        ]
+      };
+
+      // Read template from root
+      const templatePath = path.join(__dirname, 'roof-quote-template.html');
+      const rawTemplate = fs.readFileSync(templatePath, 'utf8');
+
+      // Hydrate placeholders
+      const finalHtml = populateQuoteTemplate(rawTemplate, fullQuoteData);
+
+      // Ensure /public exists and write file
+      const publicDir = path.join(__dirname, 'public');
+      if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
+
+      const fileName = `Roof_Quote_${quoteNumber}.html`;
+      fs.writeFileSync(path.join(publicDir, fileName), finalHtml, 'utf8');
+
+      // Build the public URL using the Render host
+      const host = req.get('host');
+      const fileUrl = `https://${host}/files/${fileName}`;
+
+      // Send to WhatsApp: Text link + Document attachment
+      await sendWhatsAppMessage(senderPhone, `Your estimate proposal is ready!\n\nReview it online:\n${fileUrl}`);
+      await sendWhatsAppDocument(senderPhone, fileUrl, fileName, `Estimate Proposal ${quoteNumber}`);
+      return;
+    }
+
+    // Still asking intake questions
+    await sendWhatsAppMessage(senderPhone, parsed.customer_reply);
+
+  } catch (err) {
+    console.error('Processing error:', err);
+  }
+});
+
+async function sendWhatsAppMessage(to, text) {
+  try {
+    await fetch(`https://graph.facebook.com/v21.0/${waPhoneId}/messages`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${waToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'text', text: { body: text } })
+    });
+  } catch (err) {
+    console.error('WhatsApp text error:', err);
   }
 }
 
-app.listen(port, () => {
-  console.log(`Listening on port ${port}`);
-});
+async function sendWhatsAppDocument(to, fileUrl, fileName, caption) {
+  try {
+    await fetch(`https://graph.facebook.com/v21.0/${waPhoneId}/messages`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${waToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to,
+        type: 'document',
+        document: { link: fileUrl, filename: fileName, caption }
+      })
+    });
+  } catch (err) {
+    console.error('WhatsApp doc error:', err);
+  }
+}
+
+app.listen(port, () => console.log(`Server running on port ${port}`));
