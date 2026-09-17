@@ -8,29 +8,44 @@ const waToken = process.env.WA_TOKEN;
 const waPhoneId = process.env.WA_PHONE_ID;
 const geminiApiKey = process.env.GEMINI_API_KEY;
 
-// In-memory conversation history keyed by phone number
-const conversations = new Map();
+// Store state per phone number in memory
+// Schema: { currentStep: number, data: Object, isComplete: boolean }
+const userSessions = new Map();
 
-const ROOFING_INTAKE_PROMPT = `
-You are an expert, professional intake assistant for a roofing contractor business.
-Your goal is to collect the essential details needed to build an accurate roof estimate.
+const DEFAULT_STATE = {
+  property_address: null,
+  scope_of_work: null, // full tear-off, repair, new construction
+  existing_roof_material: null, // shingle, tile, metal, flat
+  desired_new_material: null,
+  building_stories: null, // 1-story, 2-story
+  active_leaks_or_decking_damage: null,
+  insurance_or_retail: null,
+  timeline: null,
+  client_name: null
+};
 
-Required Information to Collect:
-1. Property Address (street, city, zip)
-2. Scope of Work (full tear-off replacement, leak/repair, or new construction)
-3. Existing Roof Material (shingles, tile, metal, flat/mod-bit)
-4. Desired New Roof Material (architectural shingles, standing seam metal, tile, flat roof coating)
-5. Stories / Building Height (1-story, 2-story, etc.)
-6. Known Leaks or Decking Damage (interior water spots, rotted plywood)
-7. Insurance Claim or Retail/Cash
-8. Desired Timeline (emergency, within 2 weeks, within a month)
-9. Client Name & Best Email for the formal quote
+const PROTOCOL_INSTRUCTIONS = `
+You are an AI intake coordinator for a professional roofing contractor.
+Your objective is to guide the user through a strict, sequential intake protocol.
 
-Conversation Guidelines:
-- Ask only ONE question at a time.
-- If the user provides multiple pieces of information in one message (e.g., "Need an asphalt shingle replacement at 104 Main St"), acknowledge what they gave and smoothly ask for the next missing item.
-- Keep messages short, professional, and readable on WhatsApp (use bullet points or emojis sparingly).
-- Once all items are gathered, output a clean, formatted summary of the job specs and confirm that the estimating team will reach out with the formal proposal.
+Protocol Sequence:
+1. property_address: Street address, city, and zip.
+2. scope_of_work: Full tear-off replacement, leak repair, or new construction.
+3. existing_roof_material: Current material (shingles, tile, metal, flat/mod-bit).
+4. desired_new_material: Material to install (architectural shingles, metal, tile, coating).
+5. building_stories: Height/stories (1-story, 2-story, etc.).
+6. active_leaks_or_decking_damage: Any current leaks or damaged wood/plywood.
+7. insurance_or_retail: Insurance claim or direct retail/cash quote.
+8. timeline: Preferred timeline (immediate emergency, 2-4 weeks, flexible).
+9. client_name: Name and best contact info for the proposal.
+
+Rules:
+- You must output VALID JSON only, following the exact schema provided.
+- Inspect the user's message and update "collected_data" with any provided details. If they provide multiple fields at once, extract all of them.
+- Look at the first field in the protocol sequence that remains null. That determines the next question.
+- "customer_reply": Ask ONLY ONE concise, professional question for that missing item. Do not combine multiple questions.
+- If the user asks an off-topic question, briefly redirect them back to the current protocol question in "customer_reply".
+- When all 9 items are filled, set "is_complete": true. Set "customer_reply" to a crisp bulleted summary of the project details, stating that an estimator will review aerial imagery and provide the quote.
 `;
 
 // Meta Webhook Verification (GET)
@@ -46,9 +61,8 @@ app.get('/', (req, res) => {
   }
 });
 
-// Incoming Webhook Events (POST)
+// Incoming Webhook (POST)
 app.post('/', async (req, res) => {
-  console.log('>>> WEBHOOK RECEIVED PAYLOAD <<<');
   res.status(200).send('EVENT_RECEIVED');
 
   const value = req.body.entry?.[0]?.changes?.[0]?.value || req.body.value;
@@ -61,50 +75,85 @@ app.post('/', async (req, res) => {
   const senderPhone = message.from;
   const incomingText = message.text.body;
 
-  console.log(`From: ${senderPhone} | Message: ${incomingText}`);
+  console.log(`\n--- Incoming from ${senderPhone}: "${incomingText}" ---`);
 
-  if (!conversations.has(senderPhone)) {
-    conversations.set(senderPhone, []);
+  // Initialize session state if first-time sender
+  if (!userSessions.has(senderPhone)) {
+    userSessions.set(senderPhone, {
+      data: { ...DEFAULT_STATE },
+      isComplete: false
+    });
   }
-  const history = conversations.get(senderPhone);
 
-  history.push({
-    role: 'user',
-    parts: [{ text: incomingText }]
-  });
+  const session = userSessions.get(senderPhone);
 
-  if (history.length > 16) {
-    history.splice(0, history.length - 16);
+  // If already finished, acknowledge and stop re-prompting
+  if (session.isComplete) {
+    await sendWhatsAppMessage(
+      senderPhone,
+      "We already have your intake details on file! A roofing specialist will reach out shortly. If you need immediate assistance, please give our office a call."
+    );
+    return;
   }
 
   try {
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${geminiApiKey}`;
-    
+
+    const promptPayload = {
+      system_instruction: {
+        parts: [{ text: PROTOCOL_INSTRUCTIONS }]
+      },
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: JSON.stringify({
+                current_state: session.data,
+                user_message: incomingText
+              })
+            }
+          ]
+        }
+      ],
+      generationConfig: {
+        response_mime_type: 'application/json',
+        temperature: 0.1 // Low temperature ensures strict compliance
+      }
+    };
+
     const aiResponse = await fetch(geminiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        system_instruction: {
-          parts: [{ text: ROOFING_INTAKE_PROMPT }]
-        },
-        contents: history
-      })
+      body: JSON.stringify(promptPayload)
     });
 
     const aiData = await aiResponse.json();
-    console.log('Gemini raw response:', JSON.stringify(aiData));
+    const rawAiOutput = aiData.candidates?.[0]?.content?.parts?.[0]?.text;
 
-    const replyText =
-      aiData.candidates?.[0]?.content?.parts?.[0]?.text ||
-      'Thanks for reaching out! Could you share the property address for your roofing project?';
+    if (!rawAiOutput) {
+      console.error('Gemini error response:', JSON.stringify(aiData));
+      return;
+    }
 
-    history.push({
-      role: 'model',
-      parts: [{ text: replyText }]
-    });
+    const parsed = JSON.parse(rawAiOutput);
+    console.log('Structured Extraction:', parsed.collected_data);
 
-    console.log(`Gemini Reply: ${replyText}`);
+    // Save updated state back into memory
+    session.data = { ...session.data, ...parsed.collected_data };
+    session.isComplete = Boolean(parsed.is_complete);
 
+    // Send the structured conversational reply to WhatsApp
+    await sendWhatsAppMessage(senderPhone, parsed.customer_reply);
+
+  } catch (err) {
+    console.error('Processing failure:', err);
+  }
+});
+
+// Outgoing WhatsApp sender
+async function sendWhatsAppMessage(to, text) {
+  try {
     const waResponse = await fetch(`https://graph.facebook.com/v21.0/${waPhoneId}/messages`, {
       method: 'POST',
       headers: {
@@ -114,18 +163,18 @@ app.post('/', async (req, res) => {
       body: JSON.stringify({
         messaging_product: 'whatsapp',
         recipient_type: 'individual',
-        to: senderPhone,
+        to: to,
         type: 'text',
-        text: { body: replyText }
+        text: { body: text }
       })
     });
 
-    const waData = await waResponse.json();
-    console.log('WhatsApp send result:', waData);
-  } catch (err) {
-    console.error('Processing error:', err);
+    const resData = await waResponse.json();
+    console.log('WhatsApp Delivery Status:', resData.messages ? 'Sent' : resData);
+  } catch (error) {
+    console.error('WhatsApp dispatch error:', error);
   }
-});
+}
 
 app.listen(port, () => {
   console.log(`Listening on port ${port}`);
